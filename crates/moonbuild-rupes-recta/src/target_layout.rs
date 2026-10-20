@@ -392,7 +392,13 @@ impl TargetLayout {
         }
 
         let package = pkg_list.all_packages(false).find_map(|(_, package)| {
-            (reported.parent()? == package.root_path).then_some(package)
+            // Compiler paths and canonical roots may spell drive/UNC prefixes
+            // differently. Containment in both directions requires the same
+            // directory, without shortening paths used for I/O.
+            let reported_root = reported.parent()?;
+            (moonutil::path::starts_with_equivalent_prefix(reported_root, &package.root_path)
+                && moonutil::path::starts_with_equivalent_prefix(&package.root_path, reported_root))
+            .then_some(package)
         })?;
         Some(self.package_dir(&package.fqn, backend).join(filename))
     }
@@ -445,20 +451,9 @@ impl TargetLayout {
         result
     }
 
-    pub fn runtime_archive_path(
-        &self,
-        backend: TargetBackend,
-        os: OperatingSystem,
-        static_archive_fingerprint: Option<&str>,
-    ) -> PathBuf {
+    pub fn runtime_archive_path(&self, backend: TargetBackend, os: OperatingSystem) -> PathBuf {
         let mut result = self.runtime_output_dir(backend);
-        let filename = match static_archive_fingerprint {
-            Some(fingerprint) => {
-                format!("libruntime-{fingerprint}{}", static_library_ext(os))
-            }
-            None => format!("libruntime{}", static_library_ext(os)),
-        };
-        result.push(filename);
+        result.push(format!("libruntime{}", static_library_ext(os)));
         result
     }
 
@@ -574,26 +569,21 @@ impl TargetLayout {
 
     /// Returns the path for a C stub static library archive.
     ///
-    /// Format: `_build/{backend}/{opt_level}/build/{package_path}/lib{package_name}[-{fingerprint}].a`
+    /// Format: `_build/{backend}/{opt_level}/build/{package_path}/lib{package_name}.a`
     pub fn c_stub_archive_path(
         &self,
         pkg_list: &DiscoverResult,
         package: PackageId,
         backend: TargetBackend,
         os: OperatingSystem,
-        static_archive_fingerprint: Option<&str>,
     ) -> PathBuf {
         let pkg_fqn = &pkg_list.get_package(package).fqn;
         let mut base_dir = self.package_dir(pkg_fqn, backend);
-        let filename = match static_archive_fingerprint {
-            Some(fingerprint) => format!(
-                "lib{}-{fingerprint}{}",
-                pkg_fqn.short_alias(),
-                static_library_ext(os)
-            ),
-            None => format!("lib{}{}", pkg_fqn.short_alias(), static_library_ext(os)),
-        };
-        base_dir.push(filename);
+        base_dir.push(format!(
+            "lib{}{}",
+            pkg_fqn.short_alias(),
+            static_library_ext(os)
+        ));
         base_dir
     }
 
@@ -821,15 +811,11 @@ impl ArtifactPathResolver {
                 ),
             ],
             ArtifactKey::CStubLibrary { package } => {
-                let BuildAction::ArchiveOrLinkCStubs { info, .. } = action_context else {
-                    unreachable!("C stub library artifacts require C stub library actions")
-                };
                 vec![self.target_layout.c_stub_archive_path(
                     packages,
                     *package,
                     options.target_backend(),
                     options.os,
-                    info.static_archive_fingerprint.as_deref(),
                 )]
             }
             ArtifactKey::LinkedCore {
@@ -901,16 +887,10 @@ impl ArtifactPathResolver {
                     options.os,
                 )]
             }
-            ArtifactKey::RuntimeLibrary => {
-                let BuildAction::BuildRuntimeLib { info } = action_context else {
-                    unreachable!("runtime library artifacts require runtime library actions")
-                };
-                vec![self.target_layout.runtime_archive_path(
-                    options.target_backend(),
-                    options.os,
-                    info.static_archive_fingerprint.as_deref(),
-                )]
-            }
+            ArtifactKey::RuntimeLibrary => vec![
+                self.target_layout
+                    .runtime_archive_path(options.target_backend(), options.os),
+            ],
             ArtifactKey::GeneratedMbti {
                 package,
                 target_kind,
@@ -1237,7 +1217,6 @@ mod tests {
             opt_level: moonutil::compiler_flags::OptLevel::None,
             cc_flags: Vec::new(),
             link_args: Vec::new(),
-            static_archive_fingerprint: Some("c-stubs-test".to_string()),
         }
     }
 
@@ -1258,7 +1237,6 @@ mod tests {
             enable_backtrace: false,
             source_files: vec![PathBuf::from("runtime.c")],
             simdutf_objects: Vec::new(),
-            static_archive_fingerprint: Some("runtime-test".to_string()),
             native_allocator: NativeAllocator::Default,
         }
     }
@@ -1405,6 +1383,53 @@ mod tests {
                 "_build/wasm-gc/debug/build/ffi/__generated_driver_for_internal_test.mbt"
             ))
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn generated_test_driver_diagnostics_match_windows_path_spellings() {
+        let (mut packages, modules, package) = package_fixture("username/hello", "ffi");
+        let layout = layout(TargetLayoutMode::Mono {
+            main_module: modules.module_source(modules.input_module_ids()[0]).clone(),
+        });
+        let filename = "__generated_driver_for_internal_test.mbt";
+        let long_root = PathBuf::from(r"\\?\C:\project").join("segment\\".repeat(40));
+
+        for (root, reported_root) in [
+            (
+                PathBuf::from(r"\\?\C:\project\ffi"),
+                PathBuf::from(r"C:\project\ffi"),
+            ),
+            (
+                PathBuf::from(r"C:\project\ffi"),
+                PathBuf::from(r"\\?\C:\project\ffi"),
+            ),
+            (
+                PathBuf::from(r"\\?\UNC\server\share\ffi"),
+                PathBuf::from(r"\\server\share\ffi"),
+            ),
+            (long_root.clone(), long_root),
+        ] {
+            packages.get_package_mut(package).root_path = root;
+            assert_eq!(
+                layout.generated_test_driver_diagnostic_path(
+                    &packages,
+                    &reported_root.join(filename),
+                    TargetBackend::WasmGC,
+                ),
+                Some(PathBuf::from("_build/wasm-gc/debug/build/ffi").join(filename)),
+                "reported root {reported_root:?}, package root {:?}",
+                packages.get_package(package).root_path,
+            );
+            assert_eq!(
+                layout.generated_test_driver_diagnostic_path(
+                    &packages,
+                    &reported_root.join("other-package").join(filename),
+                    TargetBackend::WasmGC,
+                ),
+                None,
+            );
+        }
     }
 
     #[test]
@@ -1630,23 +1655,7 @@ mod tests {
             }),
             None,
         );
-        let mut info = c_stubs_info();
-        assert_eq!(
-            resolver.paths_for_artifact(
-                &ArtifactKey::CStubLibrary { package },
-                BuildAction::ArchiveOrLinkCStubs {
-                    package,
-                    info: &info,
-                },
-                &packages,
-                &modules,
-                artifact_options(ExecutableArtifact::NativeExecutable),
-            ),
-            vec![PathBuf::from(
-                "_build/native/debug/build/ffi/libffi-c-stubs-test.a"
-            )],
-        );
-        info.static_archive_fingerprint = None;
+        let info = c_stubs_info();
         assert_eq!(
             resolver.paths_for_artifact(
                 &ArtifactKey::CStubLibrary { package },
@@ -1678,23 +1687,6 @@ mod tests {
                 &ArtifactKey::RuntimeLibrary,
                 BuildAction::BuildRuntimeLib {
                     info: &runtime_info(),
-                },
-                &packages,
-                &modules,
-                options,
-            ),
-            vec![PathBuf::from(
-                "_build/native/debug/build/libruntime-runtime-test.a"
-            )],
-        );
-
-        let mut exact_runtime_info = runtime_info();
-        exact_runtime_info.static_archive_fingerprint = None;
-        assert_eq!(
-            resolver.paths_for_artifact(
-                &ArtifactKey::RuntimeLibrary,
-                BuildAction::BuildRuntimeLib {
-                    info: &exact_runtime_info,
                 },
                 &packages,
                 &modules,

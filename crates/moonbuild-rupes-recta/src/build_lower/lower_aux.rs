@@ -21,7 +21,7 @@
 use moonutil::{
     compiler_flags::{
         ArchiverConfigBuilder, CCConfigBuilder, OptLevel as CCOptLevel, OutputType as CCOutputType,
-        make_archiver_command_resolved, make_cc_command_resolved,
+        make_cc_command_resolved,
     },
     resolution::{ModuleId, ModuleSourceKind},
     test_metadata::DriverKind,
@@ -122,9 +122,9 @@ impl<'a> super::LoweringContext<'a> {
 
         // The generated driver embeds moon's private test-driver protocol, so
         // cached driver artifacts must invalidate when the moon binary changes.
+        // Common command lowering records the executable as an input.
         let mut extra_inputs = files_vec;
         extra_inputs.extend_from_slice(&info.doctest_files);
-        extra_inputs.push(BINARIES.moonbuild.clone());
         if let Some(patch_file) = &info.patch_file {
             extra_inputs.push(patch_file.clone());
         }
@@ -265,26 +265,20 @@ impl<'a> super::LoweringContext<'a> {
             .archive_moonbitrun(false)
             .build()
             .expect("Failed to build archiver configuration");
-        let member_args = object_files
-            .iter()
-            .map(|member| member.to_string_lossy())
-            .collect::<Vec<_>>();
-        let commandline = make_archiver_command_resolved(
-            info.effective_native_toolchain.cc().clone(),
+        let mut command = BuildCommand::archive(
+            &info.effective_native_toolchain,
             config,
-            &member_args,
-            &artifact_path.display().to_string(),
+            &object_files,
+            &artifact_path,
             self.opt
                 .backend
                 .compiler_paths()
                 .expect("native lowering requires compiler paths"),
         );
-
-        BuildCommand {
-            extra_inputs: info.simdutf_objects.clone(),
-            commandline: commandline.into(),
-        }
-        .with_msvc_env(&info.effective_native_toolchain)
+        command
+            .extra_inputs
+            .extend(info.simdutf_objects.iter().cloned());
+        command
     }
 
     #[instrument(level = Level::DEBUG, skip(self, artifacts))]
@@ -373,7 +367,7 @@ impl<'a> super::LoweringContext<'a> {
 
         let commandline = if let Some(embed_args) = info.command.strip_prefix(":embed ") {
             let mut commandline = vec![
-                BINARIES.moonbuild.display().to_string(),
+                dunce::simplified(&BINARIES.moonbuild).display().to_string(),
                 "tool".to_string(),
                 "embed".to_string(),
             ];
@@ -384,7 +378,7 @@ impl<'a> super::LoweringContext<'a> {
             commandline
         } else {
             vec![
-                BINARIES.moonbuild.display().to_string(),
+                dunce::simplified(&BINARIES.moonbuild).display().to_string(),
                 "tool".to_string(),
                 "exec".to_string(),
                 "--shell".to_string(),

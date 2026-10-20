@@ -26,6 +26,7 @@ mod check;
 mod gen_node_test_package_config;
 mod gen_test_driver;
 mod link_core;
+mod moon_archive;
 mod moondoc;
 mod mooninfo;
 pub(super) mod msvc;
@@ -46,6 +47,7 @@ pub(super) use self::check::*;
 pub(super) use self::gen_node_test_package_config::*;
 pub(super) use self::gen_test_driver::*;
 pub(super) use self::link_core::*;
+pub(super) use self::moon_archive::*;
 pub(super) use self::moondoc::*;
 pub(super) use self::mooninfo::*;
 pub(super) use self::prove::*;
@@ -84,9 +86,13 @@ impl<'a> MiDependency<'a> {
             } else {
                 alias.to_string()
             };
-            format!("{}:{}", self.path.display(), alias)
+            format!("{}:{}", dunce::simplified(&self.path).display(), alias)
         } else {
-            format!("{}:{}", self.path.display(), self.path.display())
+            format!(
+                "{}:{}",
+                dunce::simplified(&self.path).display(),
+                dunce::simplified(&self.path).display()
+            )
         }
     }
 
@@ -185,7 +191,11 @@ pub(super) struct PackageSource<'a> {
 
 impl<'a> PackageSource<'a> {
     pub(super) fn to_arg(&self) -> String {
-        format!("{}:{}", self.package_name, self.source_dir.display())
+        format!(
+            "{}:{}",
+            self.package_name,
+            dunce::simplified(&self.source_dir).display()
+        )
     }
 }
 
@@ -251,7 +261,11 @@ pub(super) trait CmdlineAbstraction {
 
     /// Build the full command with executable and arguments.
     fn build_command(&self, executable: impl AsRef<OsStr>) -> Vec<String> {
-        let mut args = vec![executable.as_ref().to_string_lossy().into_owned()];
+        let mut args = vec![
+            dunce::simplified(Path::new(executable.as_ref()))
+                .to_string_lossy()
+                .into_owned(),
+        ];
         self.to_args(&mut args);
         args
     }

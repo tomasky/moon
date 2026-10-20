@@ -60,9 +60,7 @@ use super::{
     BuildCStubsInfo, BuildPlanConstructError, BuildRuntimeInfo, BuildTargetInfo, LinkCoreInfo,
     MakeExecutableInfo, PackagePrebuildKey,
     artifact::{ArtifactKey, package_file_key, runtime_source_key},
-    c_stub_archive_fingerprint,
     constructor::{BuildPlanConstructor, PackageFileSet},
-    runtime_archive_fingerprint,
 };
 
 static BUILD_VAR_REGEX: LazyLock<Regex> =
@@ -935,11 +933,6 @@ impl<'a> BuildPlanConstructor<'a> {
             prebuild.append_link_args(std::iter::once(target), &mut link_args);
         }
 
-        let static_archive_fingerprint = effective_native_toolchain
-            .cc()
-            .archiver_updates_existing_archive()
-            .then(|| c_stub_archive_fingerprint(&pkg.c_stub_files));
-
         // Backtrace-only requests concern MoonBit source locations. They must
         // not change the debug or optimization settings of user-written C stubs.
         let debug_info = self.config.debug_info.symbols == DebugSymbols::Full;
@@ -956,7 +949,6 @@ impl<'a> BuildPlanConstructor<'a> {
             opt_level,
             cc_flags,
             link_args,
-            static_archive_fingerprint,
         };
         self.res.backend.c_stubs_info.insert(target, c_info);
         self.resolved_node(node);
@@ -1502,10 +1494,6 @@ impl<'a> BuildPlanConstructor<'a> {
         } else {
             Vec::new()
         };
-        let static_archive_fingerprint = effective_native_toolchain
-            .cc()
-            .archiver_updates_existing_archive()
-            .then(|| runtime_archive_fingerprint(&source_files, &simdutf_objects));
         let native_allocator = self
             .config
             .backend
@@ -1524,7 +1512,6 @@ impl<'a> BuildPlanConstructor<'a> {
             enable_backtrace,
             source_files,
             simdutf_objects,
-            static_archive_fingerprint,
             native_allocator,
         });
 
@@ -1726,26 +1713,12 @@ impl<'a> BuildPlanConstructor<'a> {
         let input_paths = prebuild_cmd
             .input()
             .iter()
-            .map(|path| {
-                let input_path = Path::new(path);
-                if input_path.is_absolute() {
-                    input_path.to_path_buf()
-                } else {
-                    RelativePath::new(path).normalize().to_path(&pkg.root_path)
-                }
-            })
+            .map(|path| resolve_prebuild_path(&pkg.root_path, path))
             .collect::<Vec<_>>();
         let output_paths = prebuild_cmd
             .output()
             .iter()
-            .map(|path| {
-                let output_path = Path::new(path);
-                if output_path.is_absolute() {
-                    output_path.to_path_buf()
-                } else {
-                    RelativePath::new(path).normalize().to_path(&pkg.root_path)
-                }
-            })
+            .map(|path| resolve_prebuild_path(&pkg.root_path, path))
             .collect::<Vec<_>>();
         let command_cwd = module.as_path();
         let command_input_paths = prebuild_command_paths(command_cwd, &input_paths);
@@ -1932,8 +1905,28 @@ fn resolve_prebuild_command(
     resolved
 }
 
+fn resolve_prebuild_path(package_root: &Path, path: &str) -> PathBuf {
+    if Path::new(path).is_absolute() {
+        return path.into();
+    }
+    if cfg!(windows) {
+        // Package roots are canonical. Native joining resolves remaining `..`
+        // and converts separators when extending a Windows verbatim root.
+        // Canonicalizing the completed path would require outputs to exist.
+        package_root.join(path)
+    } else {
+        // Preserve the existing lexical normalization on other platforms.
+        RelativePath::new(path).normalize().to_path(package_root)
+    }
+}
+
 fn prebuild_command_path(cwd: &Path, path: &Path) -> String {
-    match path.relative_to(cwd) {
+    // Preserve matching canonical roots: a long child may keep its prefix when
+    // its short cwd can be simplified. Only reconcile spellings on mismatch.
+    match path
+        .relative_to(cwd)
+        .or_else(|_| dunce::simplified(path).relative_to(dunce::simplified(cwd)))
+    {
         Ok(relative_path) => {
             let normalized = relative_path.normalize();
             if normalized.as_str().is_empty() {
@@ -1942,7 +1935,7 @@ fn prebuild_command_path(cwd: &Path, path: &Path) -> String {
                 format!("./{normalized}")
             }
         }
-        Err(_) => path.display().to_string(),
+        Err(_) => dunce::simplified(path).display().to_string(),
     }
 }
 
@@ -2017,6 +2010,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn prebuild_paths_use_native_verbatim_joining() {
+        for prefix in [r"\\?\C:", r"\\?\UNC\server\share"] {
+            let root = PathBuf::from(format!(r"{prefix}\project\pkg"));
+            for (relative, expected) in [
+                ("../a/b/c", r"\project\a\b\c"),
+                ("../assets/./file", r"\project\assets\file"),
+                (r"..\assets\.\file", r"\project\assets\file"),
+                (r"../assets\..\file", r"\project\file"),
+                ("../../../../file", r"\file"),
+                ("../assets/nonexistent", r"\project\assets\nonexistent"),
+            ] {
+                let path = resolve_prebuild_path(&root, relative);
+                assert_eq!(
+                    path.as_os_str(),
+                    Path::new(&format!("{prefix}{expected}")).as_os_str(),
+                    "root={root:?}, relative={relative:?}",
+                );
+                assert!(!path.to_str().unwrap().contains('/'));
+                assert!(!path.components().any(|component| matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn prebuild_command_path_is_relative_to_command_cwd() {
         assert_eq!(
             prebuild_command_path(Path::new("module"), Path::new("module/src/lib/input.txt")),
@@ -2054,6 +2075,61 @@ mod tests {
                 Path::new("/module/src/lib/../assets/input.txt")
             ),
             "./src/assets/input.txt"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuild_command_path_handles_windows_prefix_spellings() {
+        for cwd in [r"C:\project", r"\\?\C:\project"] {
+            for path in [r"C:\project\input.txt", r"\\?\C:\project\input.txt"] {
+                assert_eq!(
+                    prebuild_command_path(Path::new(cwd), Path::new(path)),
+                    "./input.txt",
+                    "cwd={cwd}, path={path}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuild_command_path_preserves_matching_roots_when_only_one_path_simplifies() {
+        let cwd = Path::new(r"\\?\C:\project");
+        let path = cwd.join("segment\\".repeat(40)).join("input.txt");
+        assert_ne!(dunce::simplified(cwd), cwd);
+        assert_eq!(dunce::simplified(&path), path);
+        assert_eq!(
+            prebuild_command_path(cwd, &path),
+            format!("./{}input.txt", "segment/".repeat(40))
+        );
+        // Reverse the direction: the cwd is long, but the target is short.
+        assert_eq!(
+            prebuild_command_path(path.parent().unwrap(), &cwd.join("output.txt")),
+            format!("./{}output.txt", "../".repeat(40))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prebuild_command_path_keeps_safe_absolute_fallbacks() {
+        let path = Path::new(r"\\?\C:\project")
+            .join("segment\\".repeat(40))
+            .join("input.txt");
+        // The short ordinary cwd cannot be reconciled by removing the long
+        // path's required prefix. Fall back to the original usable spelling.
+        assert_eq!(
+            prebuild_command_path(Path::new(r"C:\project"), &path),
+            path.display().to_string()
+        );
+        assert_eq!(
+            prebuild_command_path(Path::new(r"C:\project"), Path::new(r"\\?\D:\input.txt")),
+            r"D:\input.txt"
+        );
+        let unc = Path::new(r"\\?\UNC\server\share\project");
+        assert_eq!(
+            prebuild_command_path(unc, &unc.join("input.txt")),
+            "./input.txt"
         );
     }
 
